@@ -1,0 +1,126 @@
+name: DevOps Transformation — CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  APP_NAME:    retail-platform
+  REGISTRY:    ghcr.io/${{ github.repository_owner }}
+  PYTHON_VER:  "3.11"
+
+jobs:
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VER }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r app/requirements.txt
+          pip install flake8 pytest pytest-cov
+
+      - name: Lint
+        run: flake8 app/src/ --max-line-length=120
+
+      - name: Test with coverage
+        run: |
+          python -m pytest app/tests/ -v \
+            --cov=app/src \
+            --cov-report=xml \
+            --cov-fail-under=80 \
+            --junitxml=junit.xml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
+
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.APP_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest
+            type=raw,value=${{ github.run_number }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context:   .
+          file:      docker/Dockerfile
+          push:      true
+          tags:      ${{ steps.meta.outputs.tags }}
+          build-args: |
+            APP_VERSION=1.0.${{ github.run_number }}
+            BUILD_NUMBER=${{ github.run_number }}
+
+      - name: Security scan (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.APP_NAME }}:${{ github.run_number }}
+          severity:  HIGH,CRITICAL
+          exit-code: 0
+
+  deploy:
+    name: Deploy with Ansible
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ansible
+        run: pip install ansible
+
+      - name: Write SSH key
+        run: |
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > /tmp/deploy.pem
+          chmod 600 /tmp/deploy.pem
+
+      - name: Run Ansible deploy playbook
+        run: |
+          ansible-playbook \
+            -i ansible/inventory/production.ini \
+            ansible/deploy.yml \
+            --private-key=/tmp/deploy.pem \
+            --extra-vars "app_version=1.0.${{ github.run_number }} \
+                          build_number=${{ github.run_number }} \
+                          image_name=${{ env.REGISTRY }}/${{ env.APP_NAME }}:${{ github.run_number }}"
+
+      - name: Smoke test
+        run: |
+          sleep 20
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              "http://${{ secrets.DEPLOY_HOST }}:8080/health")
+          [ "$STATUS" = "200" ] && echo "✅ Smoke test PASSED" || { echo "❌ FAILED"; exit 1; }

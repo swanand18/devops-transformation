@@ -1,0 +1,167 @@
+---
+# ============================================================
+#  ansible/deploy.yml — Full stack deployment playbook
+#  Author: Swanand Awatade | Binary Hat Pvt. Ltd.
+#  Deploys: App + Prometheus + Grafana + Node Exporter
+# ============================================================
+
+- name: Deploy DevOps Transformation Stack
+  hosts: production
+  become: yes
+  vars:
+    app_dir:        /opt/retail-platform
+    app_port:       8080
+    prometheus_port: 9090
+    grafana_port:   3000
+    node_exp_port:  9100
+    docker_network: monitoring
+
+  tasks:
+
+    # ── Pre-flight ─────────────────────────────────────────
+    - name: Install Docker and dependencies
+      dnf:
+        name: [docker, python3-pip, git, curl]
+        state: present
+        update_cache: yes
+
+    - name: Install Docker Compose plugin
+      shell: |
+        mkdir -p /usr/local/lib/docker/cli-plugins
+        curl -SL https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-x86_64 \
+            -o /usr/local/lib/docker/cli-plugins/docker-compose
+        chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+      args:
+        creates: /usr/local/lib/docker/cli-plugins/docker-compose
+
+    - name: Start and enable Docker
+      systemd:
+        name: docker
+        enabled: yes
+        state:   started
+
+    - name: Add ec2-user to docker group
+      user:
+        name:   ec2-user
+        groups: docker
+        append: yes
+
+    # ── Directory Structure ────────────────────────────────
+    - name: Create application directories
+      file:
+        path:  "{{ item }}"
+        state: directory
+        owner: ec2-user
+        mode:  "0755"
+      loop:
+        - "{{ app_dir }}"
+        - "{{ app_dir }}/monitoring/prometheus"
+        - "{{ app_dir }}/monitoring/grafana/provisioning/datasources"
+        - "{{ app_dir }}/monitoring/grafana/provisioning/dashboards"
+        - "{{ app_dir }}/monitoring/grafana/dashboards"
+
+    # ── Copy Config Files ──────────────────────────────────
+    - name: Copy docker-compose file
+      copy:
+        src:   ../docker-compose.yml
+        dest:  "{{ app_dir }}/docker-compose.yml"
+        owner: ec2-user
+        mode:  "0644"
+      notify: Restart stack
+
+    - name: Copy Prometheus config
+      copy:
+        src:   ../monitoring/prometheus/
+        dest:  "{{ app_dir }}/monitoring/prometheus/"
+        owner: ec2-user
+      notify: Reload Prometheus
+
+    - name: Copy Grafana provisioning
+      copy:
+        src:   ../monitoring/grafana/
+        dest:  "{{ app_dir }}/monitoring/grafana/"
+        owner: ec2-user
+
+    # ── Write .env file ────────────────────────────────────
+    - name: Write environment file
+      copy:
+        dest:  "{{ app_dir }}/.env"
+        owner: ec2-user
+        mode:  "0600"
+        content: |
+          APP_VERSION={{ app_version }}
+          BUILD_NUMBER={{ build_number }}
+          GRAFANA_PASSWORD={{ grafana_password | default('admin123') }}
+
+    # ── Pull & Deploy ──────────────────────────────────────
+    - name: Pull latest Docker images
+      shell: |
+        cd {{ app_dir }}
+        docker compose pull
+      become_user: ec2-user
+
+    - name: Deploy stack with Docker Compose
+      shell: |
+        cd {{ app_dir }}
+        docker compose up -d --remove-orphans
+      become_user: ec2-user
+      register: compose_output
+
+    - name: Show compose output
+      debug:
+        var: compose_output.stdout_lines
+
+    # ── Health Checks ──────────────────────────────────────
+    - name: Wait for app to become healthy
+      uri:
+        url:            "http://localhost:{{ app_port }}/health"
+        status_code:    200
+        timeout:        10
+      register: app_health
+      retries:  10
+      delay:    10
+      until:    app_health.status == 200
+
+    - name: Wait for Prometheus to be ready
+      uri:
+        url:         "http://localhost:{{ prometheus_port }}/-/ready"
+        status_code: 200
+        timeout:     10
+      register: prom_health
+      retries:  8
+      delay:    10
+      until:    prom_health.status == 200
+
+    - name: Wait for Grafana to be ready
+      uri:
+        url:         "http://localhost:{{ grafana_port }}/api/health"
+        status_code: 200
+        timeout:     10
+      register: grafana_health
+      retries:  8
+      delay:    10
+      until:    grafana_health.status == 200
+
+    - name: Print deployment summary
+      debug:
+        msg:
+          - "========================================"
+          - "  ✅ DEPLOYMENT COMPLETE"
+          - "  App       : http://{{ inventory_hostname }}:{{ app_port }}"
+          - "  Prometheus: http://{{ inventory_hostname }}:{{ prometheus_port }}"
+          - "  Grafana   : http://{{ inventory_hostname }}:{{ grafana_port }}"
+          - "  Version   : {{ app_version }}"
+          - "  Build     : {{ build_number }}"
+          - "========================================"
+
+  handlers:
+    - name: Restart stack
+      shell: |
+        cd {{ app_dir }}
+        docker compose restart
+      become_user: ec2-user
+
+    - name: Reload Prometheus
+      uri:
+        url:    "http://localhost:9090/-/reload"
+        method: POST

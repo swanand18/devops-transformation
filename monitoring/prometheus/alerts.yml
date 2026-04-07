@@ -1,0 +1,127 @@
+# ============================================================
+#  alerts.yml — Prometheus alerting rules
+# ============================================================
+
+groups:
+
+  # ── Application Alerts ────────────────────────────────────
+  - name: application
+    rules:
+
+      - alert: AppHighErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+          /
+          sum(rate(http_requests_total[5m])) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          team:     platform
+        annotations:
+          summary:     "High HTTP 5xx error rate ({{ $value | humanizePercentage }})"
+          description: "Error rate above 5% for 2 minutes. Current: {{ $value | humanizePercentage }}"
+          runbook:     "https://wiki.internal/runbooks/high-error-rate"
+
+      - alert: AppHighLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+          ) > 2.0
+        for: 3m
+        labels:
+          severity: warning
+          team:     platform
+        annotations:
+          summary:     "High P99 request latency ({{ $value | humanizeDuration }})"
+          description: "P99 latency above 2s for 3 minutes"
+
+      - alert: AppDown
+        expr: up{job="retail-app"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          team:     platform
+        annotations:
+          summary:     "Application is DOWN"
+          description: "retail-app scrape target has been down for 1 minute"
+
+      - alert: AppNoTraffic
+        expr: sum(rate(http_requests_total[10m])) == 0
+        for: 5m
+        labels:
+          severity: warning
+          team:     platform
+        annotations:
+          summary:     "No traffic detected"
+          description: "Zero HTTP requests for 5 minutes — possible upstream issue"
+
+  # ── Infrastructure Alerts ─────────────────────────────────
+  - name: infrastructure
+    rules:
+
+      - alert: HighCPUUsage
+        expr: |
+          100 - (avg by(instance)(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+        for: 5m
+        labels:
+          severity: warning
+          team:     infrastructure
+        annotations:
+          summary:     "High CPU on {{ $labels.instance }}"
+          description: "CPU usage is {{ $value | humanize }}% for 5 minutes"
+
+      - alert: HighMemoryUsage
+        expr: |
+          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 90
+        for: 5m
+        labels:
+          severity: critical
+          team:     infrastructure
+        annotations:
+          summary:     "High memory on {{ $labels.instance }}"
+          description: "Memory usage is {{ $value | humanize }}%"
+
+      - alert: DiskSpaceLow
+        expr: |
+          (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 15
+        for: 10m
+        labels:
+          severity: warning
+          team:     infrastructure
+        annotations:
+          summary:     "Low disk space on {{ $labels.instance }}"
+          description: "Only {{ $value | humanize }}% disk space remaining on /"
+
+      - alert: DiskSpaceCritical
+        expr: |
+          (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 5
+        for: 5m
+        labels:
+          severity: critical
+          team:     infrastructure
+        annotations:
+          summary:     "CRITICAL: Disk almost full on {{ $labels.instance }}"
+          description: "Only {{ $value | humanize }}% disk space remaining"
+
+  # ── Container Alerts ──────────────────────────────────────
+  - name: containers
+    rules:
+
+      - alert: ContainerHighCPU
+        expr: |
+          sum(rate(container_cpu_usage_seconds_total{name!=""}[5m])) by (name) * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary:     "Container {{ $labels.name }} high CPU ({{ $value | humanize }}%)"
+          description: "Container CPU above 80% for 5 minutes"
+
+      - alert: ContainerRestarting
+        expr: increase(container_last_seen{name!=""}[1h]) > 3
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary:     "Container {{ $labels.name }} restarting frequently"
+          description: "Container restarted more than 3 times in the last hour"
